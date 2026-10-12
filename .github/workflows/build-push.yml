@@ -1,4 +1,4 @@
-name: Build and Push to ECR
+name: Build and Deploy to EC2
 
 on:
   push:
@@ -8,18 +8,26 @@ on:
 permissions:
   contents: read
   id-token: write
+
 concurrency:
   group: blue-green-production
   cancel-in-progress: false
+
 jobs:
   build:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: bash
 
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      AWS_PAGER: ""
 
     steps:
       - name: Checkout code
@@ -27,28 +35,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check OIDC identity
-        shell: python
+      - name: Check configuration
         run: |
-          import os, json, base64, urllib.request
-
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
-          url += "&audience=sts.amazonaws.com"
-          request = urllib.request.Request(
-              url,
-              headers={
-                  "Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
-              }
-          )
-          with urllib.request.urlopen(request) as response:
-              token = json.load(response)["value"]
-
-          payload = token.split(".")[1]
-          claims = json.loads(
-              base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
-          )
-          for key in ("iss", "aud", "sub"):
-              print(f"{key}: {claims.get(key)}")
+          set -euo pipefail
+          test -n "$AWS_REGION"
+          test -n "$ECR_REPOSITORY"
+          test -n "$EC2_INSTANCE_ID"
 
       - name: Authenticate to AWS
         uses: aws-actions/configure-aws-credentials@v6.3.0
@@ -57,10 +49,12 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Log in to ECR
-        shell: bash
         run: |
           set -euo pipefail
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          ACCOUNT_ID=$(aws sts get-caller-identity \
+            --query Account --output text)
+
           REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
 
           aws ecr get-login-password --region "$AWS_REGION" |
@@ -71,12 +65,12 @@ jobs:
 
       - name: Build image
         run: |
+          set -euo pipefail
           docker build --platform linux/amd64 \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             -t "$IMAGE_URI" .
 
       - name: Test container readiness
-        shell: bash
         run: |
           set -euo pipefail
           trap 'docker logs smoke-test; docker rm -f smoke-test' EXIT
@@ -91,7 +85,8 @@ jobs:
           READY=false
           for attempt in $(seq 1 30); do
             if curl --fail --silent --max-time 2 \
-              http://127.0.0.1:8080/ready; then
+              http://127.0.0.1:8080/ready |
+              jq -e '.status == "ready"' >/dev/null; then
               READY=true
               break
             fi
@@ -103,14 +98,78 @@ jobs:
             exit 1
           fi
 
-          curl --fail --silent --max-time 5 http://127.0.0.1:8080/version |
+          curl --fail --silent --max-time 5 \
+            http://127.0.0.1:8080/version |
             jq -e --arg commit "$GITHUB_SHA" \
               '.commit == $commit and .slot == "blue"'
 
       - name: Push image to ECR
         run: docker push "$IMAGE_URI"
 
-      - name: Write summary
+      - name: Write image summary
         run: |
           echo "### Image pushed successfully" >> "$GITHUB_STEP_SUMMARY"
           echo "$IMAGE_URI" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Deploy to EC2 through SSM
+        timeout-minutes: 18
+        run: |
+          set -euo pipefail
+
+          DEPLOY_COMMAND="bash /opt/aws-blue-green/deploy.sh '$IMAGE_URI' '$GITHUB_SHA'"
+
+          jq -n --arg command "$DEPLOY_COMMAND" \
+            '{commands: [$command], executionTimeout: ["600"]}' \
+            > ssm-parameters.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://ssm-parameters.json \
+            --timeout-seconds 60 \
+            --comment "GitHub blue-green deployment" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command: $COMMAND_ID"
+          echo "SSM command: $COMMAND_ID" >> "$GITHUB_STEP_SUMMARY"
+
+          for attempt in $(seq 1 180); do
+            if aws ssm get-command-invocation \
+              --region "$AWS_REGION" \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --output json \
+              > ssm-result.json 2> ssm-error.txt; then
+
+              STATUS=$(jq -r '.Status' ssm-result.json)
+              echo "Deployment status: $STATUS"
+
+              case "$STATUS" in
+                Success)
+                  jq -r '.StandardOutputContent, .StandardErrorContent' \
+                    ssm-result.json
+                  echo "### EC2 deployment succeeded" >> "$GITHUB_STEP_SUMMARY"
+                  echo "Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                  ;;
+                Failed|Cancelled|TimedOut)
+                  jq -r '.StandardOutputContent, .StandardErrorContent' \
+                    ssm-result.json
+                  echo "### EC2 deployment failed: $STATUS" >> "$GITHUB_STEP_SUMMARY"
+                  exit 1
+                  ;;
+              esac
+            else
+              if ! grep -q "InvocationDoesNotExist" ssm-error.txt; then
+                cat ssm-error.txt
+                exit 1
+              fi
+            fi
+
+            sleep 5
+          done
+
+          echo "Stopped waiting. Check SSM command $COMMAND_ID in AWS."
+          exit 1
