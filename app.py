@@ -16,7 +16,7 @@ def index():
     <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>Blue-Green Deployment Lab</title>
+        <title>Blue-Green Deployment Lab — Release 2</title>
         <style>
             body {
                 background: #13151f;
