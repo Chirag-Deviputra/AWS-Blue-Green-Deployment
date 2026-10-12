@@ -8,7 +8,9 @@ on:
 permissions:
   contents: read
   id-token: write
-
+concurrency:
+  group: blue-green-production
+  cancel-in-progress: false
 jobs:
   build:
     if: github.ref == 'refs/heads/main'
